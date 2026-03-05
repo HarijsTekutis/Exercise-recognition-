@@ -3,6 +3,114 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class TCNBlock(nn.Module):
+    """Single TCN residual block with dilated convolution."""
+
+    def __init__(self, input_channels: int, output_channels: int, kernel_size: int = 3, dilation: int = 1):
+        """Build a dilated conv block with batch norm and residual connection.
+
+        Args:
+            input_channels: Number of input channels.
+            output_channels: Number of output channels.
+            kernel_size: Size of the convolutional kernel.
+            dilation: Dilation factor for the convolution.
+        """
+        super().__init__()
+
+        padding = dilation * (kernel_size - 1) // 2
+
+        self.conv1 = nn.Conv1d(
+            input_channels,
+            output_channels,
+            kernel_size=kernel_size,
+            dilation=dilation,
+            padding=padding,
+        )
+        self.bn1 = nn.BatchNorm1d(output_channels)
+        self.dropout = nn.Dropout(0.2)
+
+        # Project input to output channels if needed for residual connection.
+        self.residual_projection = None
+        if input_channels != output_channels:
+            self.residual_projection = nn.Conv1d(input_channels, output_channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass with residual connection.
+
+        Input shape: (batch, channels, time)
+        Output shape: (batch, output_channels, time)
+        """
+        residual = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = F.relu(out)
+        out = self.dropout(out)
+
+        if self.residual_projection is not None:
+            residual = self.residual_projection(residual)
+
+        return out + residual
+
+
+class TCN(nn.Module):
+    """Temporal Convolutional Network for activity classification on IMU data."""
+
+    def __init__(self, num_features: int = 6, num_classes: int = 6, num_layers: int = 4, num_channels: int = 64):
+        """Build a stacked TCN with exponentially increasing dilation.
+
+        Args:
+            num_features: Number of input sensor channels per timestep.
+            num_classes: Number of output activity classes.
+            num_layers: Number of TCN blocks.
+            num_channels: Base number of channels in each block.
+        """
+        super().__init__()
+
+        self.layers = nn.ModuleList()
+
+        # Input projection to num_channels.
+        self.input_conv = nn.Conv1d(num_features, num_channels, kernel_size=1)
+
+        # Stack TCN blocks with increasing dilation.
+        for i in range(num_layers):
+            dilation = 2**i
+            in_ch = num_channels
+            out_ch = num_channels * min(2, (i // 2) + 1)  # Gradually increase channels.
+
+            self.layers.append(TCNBlock(in_ch, out_ch, kernel_size=3, dilation=dilation))
+            num_channels = out_ch
+
+        # Global average and max pooling + classification head.
+        self.dropout = nn.Dropout(0.3)
+        self.fc = nn.Linear(num_channels * 2, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Input shape: (batch, time, features)
+        Output shape: (batch, num_classes)
+        """
+        # Conv1d expects channel-first: (batch, features, time).
+        x = x.permute(0, 2, 1)
+
+        # Input projection.
+        x = self.input_conv(x)
+
+        # Pass through TCN blocks.
+        for layer in self.layers:
+            x = layer(x)
+
+        # Global temporal pooling.
+        mean_pool = x.mean(dim=2)
+        max_pool, _ = x.max(dim=2)
+        out = torch.cat([mean_pool, max_pool], dim=1)
+
+        out = self.dropout(out)
+        out = self.fc(out)
+        return out
+
+
 class CNNLSTM(nn.Module):
     """CNN + BiLSTM classifier for windowed IMU sequences."""
 
