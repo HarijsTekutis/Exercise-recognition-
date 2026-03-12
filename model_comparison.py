@@ -9,7 +9,7 @@ import torch
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from sklearn.ensemble import RandomForestClassifier
 
-from model_architecture import CNNLSTM, TCN
+from model_architecture import CNNLSTM_1, CNNLSTM_2
 from train_eval import (
     build_classification_report,
     build_training_objects,
@@ -30,7 +30,7 @@ def create_model(
     """Instantiate a model by architecture name.
 
     Args:
-        architecture: Model name ('CNNLSTM', 'TCN', or 'RandomForest').
+        architecture: Model name ('CNNLSTM_1', 'CNNLSTM_2', or 'RandomForest').
         num_features: Number of input channels (IMU sensors).
         num_classes: Number of activity classes.
         device: PyTorch device (CPU or CUDA). Ignored for sklearn models.
@@ -39,20 +39,20 @@ def create_model(
     Returns:
         Initialized model (PyTorch nn.Module or sklearn estimator).
     """
-    if architecture == "CNNLSTM":
-        model = CNNLSTM(
+    if architecture == "CNNLSTM_1":
+        model = CNNLSTM_1(
             num_features=num_features,
             num_classes=num_classes,
             hidden_dim=kwargs.get("hidden_dim", 64),
             lstm_layers=kwargs.get("lstm_layers", 2),
         )
         return model.to(device)
-    elif architecture == "TCN":
-        model = TCN(
+    elif architecture == "CNNLSTM_2":
+        model = CNNLSTM_2(
             num_features=num_features,
             num_classes=num_classes,
-            num_layers=kwargs.get("num_layers", 4),
-            num_channels=kwargs.get("num_channels", 64),
+            hidden_dim=kwargs.get("hidden_dim", 64),
+            lstm_layers=kwargs.get("lstm_layers", 2),
         )
         return model.to(device)
     elif architecture == "RandomForest":
@@ -61,7 +61,7 @@ def create_model(
             max_depth=kwargs.get("max_depth", 20),
             min_samples_split=kwargs.get("min_samples_split", 5),
             random_state=42,
-            n_jobs=-1,
+            n_jobs=-1, # To utilize all CPU cores for training
         )
     else:
         raise ValueError(f"Unknown architecture: {architecture}")

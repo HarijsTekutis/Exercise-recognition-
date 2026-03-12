@@ -10,105 +10,129 @@ from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, Dataset
 
 
+#used features for training
 IMU_FEATURES = [
-    "wristMotion_rotationRateX",
-    "wristMotion_rotationRateY",
-    "wristMotion_rotationRateZ",
-    "wristMotion_accelerationX",
-    "wristMotion_accelerationY",
-    "wristMotion_accelerationZ",
+    "A_x",
+    "A_y",
+    "A_z",
+    "G_x",
+    "G_y",
+    "G_z",
+]
+
+ACTIVITY_COLUMN = "Workout"
+SESSION_COLUMN_CANDIDATES = [
+    "Subject",
+    "Position",
+    "Session"
 ]
 
 
+def _validate_recgym_schema(df: pd.DataFrame) -> None:
+    """Validate that required columns exist before processing."""
+    missing_feature_columns = [feature for feature in IMU_FEATURES if feature not in df.columns]
+    if missing_feature_columns:
+        raise ValueError(
+            "columns are missing: "
+            f"{missing_feature_columns}"
+        )
+
+    if ACTIVITY_COLUMN not in df.columns:
+        raise ValueError(
+            f"column '{ACTIVITY_COLUMN}' is missing. "
+        )
+
+
+# Get one representative label for a session by majority vote.
+def _session_majority_label(session_df: pd.DataFrame) -> str:
+    """Return the most frequent activity label in one session dataframe."""
+    return str(session_df["activity"].mode(dropna=False).iloc[0])
+
+
+def _apply_scaler_inplace(
+    sessions: List[pd.DataFrame],
+    scaler: StandardScaler,
+    imu_features: Sequence[str],
+) -> None:
+    """Apply a fitted scaler to all sessions in place for selected feature columns."""
+    for session_df in sessions:
+        session_df.loc[:, imu_features] = scaler.transform(session_df.loc[:, imu_features])
+
+
+# Keep only required IMU + label columns and standardize label name to `activity`.
 def filter_data(df: pd.DataFrame) -> pd.DataFrame:
-    """Trim noisy edges in time and drop sensor columns that are not used.
 
-    This keeps only the central part of each recording and removes gravity/quaternion
-    channels so the downstream model sees only the core IMU signals.
-    """
-    filtered_df = df.copy()
+    _validate_recgym_schema(df)
 
-    # Remove the first/last ~1.5 seconds, which are often transition noise.
-    min_time = filtered_df["secondsElapsed"].min() + 1.5
-    max_time = filtered_df["secondsElapsed"].max() - 1.5
-    filtered_df = filtered_df[
-        (filtered_df["secondsElapsed"] >= min_time)
-        & (filtered_df["secondsElapsed"] <= max_time)
-    ].reset_index(drop=True)
+    filtered_df = df.loc[:, list(IMU_FEATURES) + [ACTIVITY_COLUMN]].copy()
+    filtered_df = filtered_df.rename(columns={ACTIVITY_COLUMN: "activity"})
+    filtered_df = filtered_df.dropna(subset=list(IMU_FEATURES) + ["activity"])
+    filtered_df["activity"] = filtered_df["activity"].astype(str).str.strip()
 
-    # Keep only the channels used by the training pipeline.
-    filtered_df = filtered_df.drop(
-        columns=[
-            "wristMotion_gravityX",
-            "wristMotion_gravityY",
-            "wristMotion_gravityZ",
-            "wristMotion_quaternionW",
-            "wristMotion_quaternionX",
-            "wristMotion_quaternionY",
-            "wristMotion_quaternionZ",
-        ],
-        errors="ignore",
-    )
-
-    return filtered_df
+    return filtered_df.reset_index(drop=True)
 
 
-def smooth_columns(df: pd.DataFrame, window: int) -> pd.DataFrame:
-    """Apply a centered moving average to every numeric column."""
-    smoothed_df = df.copy()
-    for column_name in df.columns:
-        if pd.api.types.is_numeric_dtype(df[column_name]):
-            smoothed_df[column_name] = df[column_name].rolling(window=window, center=True).mean()
-    return smoothed_df
+# Split one big table into per session recordings.
+def _split_into_sessions(df: pd.DataFrame) -> List[pd.DataFrame]:
+    available_session_columns = [
+        column_name for column_name in SESSION_COLUMN_CANDIDATES if column_name in df.columns
+    ]
+
+    grouped_sessions = []
+    for _, group_df in df.groupby(available_session_columns, dropna=False, sort=False):
+        session_df = filter_data(group_df)
+        if not session_df.empty:
+            grouped_sessions.append(session_df)
+
+    return grouped_sessions
 
 
-def load_filtered_recordings(
-    data_path: str,
-    min_recordings_per_activity: int = 5,
+# Remove activities that have too few recordings.
+def _keep_frequent_activities(
+    recordings: List[pd.DataFrame],
+    min_recordings_per_activity: int,
 ) -> List[pd.DataFrame]:
-    """Load CSV recordings, apply filtering, and keep only frequent classes.
-
-    A class is kept when its number of recordings is >= min_recordings_per_activity.
-    """
-    recordings: List[pd.DataFrame] = []
-    activity_labels: List[str] = []
-
-    # Walk through all CSV files under the dataset directory.
-    for directory_path, _, file_names in os.walk(data_path):
-        for file_name in file_names:
-            if not file_name.lower().endswith(".csv"):
-                continue
-
-            recording_df = pd.read_csv(os.path.join(directory_path, file_name))
-            filtered_recording = filter_data(recording_df)
-            if not filtered_recording.empty and "activity" in filtered_recording.columns:
-                recordings.append(filtered_recording)
-                activity_labels.append(str(filtered_recording["activity"].iloc[0]))
-
-    if not recordings:
-        raise ValueError(f"No CSV recordings found in: {data_path}")
-
-    # Count recordings per activity and keep classes above threshold.
+    activity_labels = [_session_majority_label(recording) for recording in recordings]
     activity_counts = pd.Series(activity_labels).value_counts()
     valid_activities = activity_counts[
         activity_counts >= min_recordings_per_activity
     ].index
 
     filtered_recordings = [
-        recording for recording in recordings if str(recording["activity"].iloc[0]) in valid_activities
+        recording
+        for recording in recordings
+        if _session_majority_label(recording) in valid_activities
     ]
-
-    if not filtered_recordings:
-        raise ValueError(
-            "No recordings left after activity frequency filtering. "
-            "Lower min_recordings_per_activity or check labels."
-        )
 
     return filtered_recordings
 
 
+# Read csv and return sessionized recordings.
+def _load_recgym_recordings(
+    recgym_csv_path: str,
+    min_recordings_per_activity: int,
+) -> List[pd.DataFrame]:
+    full_df = pd.read_csv(recgym_csv_path)
+    recordings = _split_into_sessions(full_df)
+   
+    return _keep_frequent_activities(recordings, min_recordings_per_activity)
+
+
+
+# filtering
+def load_filtered_recordings(
+    data_path: str,
+    min_recordings_per_activity: int = 5,
+) -> List[pd.DataFrame]:
+    recgym_csv_path = os.path.join(data_path, "RecGym.csv")
+    return _load_recgym_recordings(
+        recgym_csv_path=recgym_csv_path,
+        min_recordings_per_activity=min_recordings_per_activity,
+    )
+
+
+# Convert string activity labels to integer class IDs and add `activityEncoded` column.
 def encode_activities(dataframes: List[pd.DataFrame]) -> Dict[str, int]:
-    """Create activity -> class_id mapping and write it into each dataframe."""
     all_activity_values = pd.concat([df["activity"] for df in dataframes], ignore_index=True)
     activity_categories = all_activity_values.astype("category").cat.categories
     activity_to_id = {activity_name: idx for idx, activity_name in enumerate(activity_categories)}
@@ -121,8 +145,8 @@ def encode_activities(dataframes: List[pd.DataFrame]) -> Dict[str, int]:
     return activity_to_id
 
 
+# Replace NaN/inf values in feature columns
 def clean_imu_columns(dataframes: List[pd.DataFrame], imu_features: Sequence[str]) -> None:
-    """Replace NaN/inf values in feature columns so training stays stable."""
     for index, dataframe in enumerate(dataframes):
         cleaned_dataframe = dataframe.copy()
         cleaned_dataframe[list(imu_features)] = (
@@ -133,6 +157,7 @@ def clean_imu_columns(dataframes: List[pd.DataFrame], imu_features: Sequence[str
         dataframes[index] = cleaned_dataframe
 
 
+# Apply per-window signal preprocessing (smoothing and downsampling) used before model input.
 def preprocess_sample(
     window: np.ndarray,
     y: int,
@@ -140,10 +165,6 @@ def preprocess_sample(
     downsample_factor: int = 2,
     downsample_mode: str = "avg",
 ) -> Tuple[np.ndarray, int]:
-    """Preprocess one window: smoothing + optional downsampling.
-
-    Returns the transformed window and the unchanged class label.
-    """
     processed_window = window.astype(np.float32)
 
     # Smooth each feature with a moving-average kernel.
@@ -182,8 +203,6 @@ def preprocess_sample(
 
 
 class IMUDataset(Dataset):
-    """Windowed IMU dataset built from session-level dataframes."""
-
     def __init__(
         self,
         dataframes: List[pd.DataFrame],
@@ -193,57 +212,51 @@ class IMUDataset(Dataset):
         preprocess_fn=None,
         preprocess_kwargs=None,
     ):
-        """Create fixed-size windows from each session dataframe.
-
-        Each dataframe contributes multiple overlapping windows with one session label.
-        """
+        
         self.samples = []
         self.preprocess_fn = preprocess_fn
         self.preprocess_kwargs = preprocess_kwargs or {}
 
         for session_df in dataframes:
             feature_matrix = session_df[list(features)].values
-            session_label = int(session_df["activityEncoded"].iloc[0])
+            session_labels = session_df["activityEncoded"].to_numpy(dtype=np.int64)
 
             # Sliding window extraction.
             for start_index in range(0, len(feature_matrix) - window_size + 1, step_size):
                 end_index = start_index + window_size
                 window = feature_matrix[start_index:end_index]
+                window_labels = session_labels[start_index:end_index]
+                window_label = int(np.bincount(window_labels).argmax())
 
                 if self.preprocess_fn is not None:
                     processed_window, processed_label = self.preprocess_fn(
                         window,
-                        session_label,
+                        window_label,
                         **self.preprocess_kwargs,
                     )
                 else:
-                    processed_window, processed_label = window, session_label
+                    processed_window, processed_label = window, window_label
 
                 self.samples.append((processed_window, processed_label))
 
     def __len__(self):
-        """Number of window samples."""
         return len(self.samples)
 
     def __getitem__(self, idx):
-        """Return one sample as torch tensors: (X, y)."""
         feature_window, class_label = self.samples[idx]
         feature_window = torch.tensor(feature_window, dtype=torch.float32)
         class_label = torch.tensor(class_label, dtype=torch.long)
         return feature_window, class_label
 
 
+    # Split sessions into train/test while keeping label distribution as balanced as possible.
 def stratified_session_split(
     data: List[pd.DataFrame],
     labels: np.ndarray,
     train_ratio: float = 0.8,
     seed: int = 42,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Split sessions into train/test while handling rare classes safely.
-
-    Classes with fewer than 2 sessions cannot be stratified, so they are forced into
-    train to avoid split errors.
-    """
+   
     label_array = np.asarray(labels)
     all_session_indices = np.arange(len(label_array))
     target_train_count = int(train_ratio * len(label_array))
@@ -260,9 +273,6 @@ def stratified_session_split(
         dtype=int,
     )
 
-    if len(remaining_indices) == 0:
-        warnings.warn("All classes are rare (count<2). Putting all sessions in TRAIN.")
-        return forced_train_indices, np.array([], dtype=int)
 
     remaining_train_needed = max(0, target_train_count - len(forced_train_indices))
     remaining_total = len(remaining_indices)
@@ -306,6 +316,7 @@ def stratified_session_split(
     return np.sort(train_indices), np.sort(test_indices)
 
 
+# Build fully prepared train/test loaders (split, scale, window, dataloaders).
 def make_train_test_loaders(
     data: List[pd.DataFrame],
     imu_features: Sequence[str],
@@ -315,15 +326,11 @@ def make_train_test_loaders(
     batch_size_train: int = 32,
     batch_size_test: int = 1,
 ):
-    """Build train/test DataLoaders from session DataFrames.
+   
 
-    Pipeline:
-    1) stratified session split
-    2) fit scaler on train only
-    3) transform train/test
-    4) create window datasets and loaders
-    """
-    session_labels = np.array([int(session_df["activityEncoded"].iloc[0]) for session_df in data])
+    session_labels = np.array(
+        [int(np.bincount(session_df["activityEncoded"].to_numpy(dtype=np.int64)).argmax()) for session_df in data]
+    )
     train_indices, test_indices = stratified_session_split(
         data,
         session_labels,
@@ -334,7 +341,6 @@ def make_train_test_loaders(
     train_sessions = [data[index] for index in train_indices]
     test_sessions = [data[index] for index in test_indices]
 
-    # Fit normalization on train only (prevents test leakage).
     scaler = StandardScaler()
     train_feature_table = pd.concat(
         [session_df.loc[:, imu_features] for session_df in train_sessions],
@@ -342,11 +348,8 @@ def make_train_test_loaders(
     )
     scaler.fit(train_feature_table)
 
-    for session_df in train_sessions:
-        session_df.loc[:, imu_features] = scaler.transform(session_df.loc[:, imu_features])
-
-    for session_df in test_sessions:
-        session_df.loc[:, imu_features] = scaler.transform(session_df.loc[:, imu_features])
+    _apply_scaler_inplace(train_sessions, scaler, imu_features)
+    _apply_scaler_inplace(test_sessions, scaler, imu_features)
 
     preprocess_kwargs = dict(smooth_kernel=5, downsample_factor=2, downsample_mode="avg")
 
@@ -368,10 +371,6 @@ def make_train_test_loaders(
         preprocess_kwargs=preprocess_kwargs,
     )
 
-    if len(train_dataset) == 0:
-        raise ValueError("Train dataset has 0 windows. Reduce window_size/step_size.")
-    if len(test_dataset) == 0:
-        raise ValueError("Test dataset has 0 windows. Reduce window_size/step_size.")
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size_test, shuffle=False)
