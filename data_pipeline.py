@@ -157,13 +157,11 @@ def clean_imu_columns(dataframes: List[pd.DataFrame], imu_features: Sequence[str
         dataframes[index] = cleaned_dataframe
 
 
-# Apply per-window signal preprocessing (smoothing and downsampling) used before model input.
+# Apply per-window smoothing
 def preprocess_sample(
     window: np.ndarray,
     y: int,
     smooth_kernel: int = 5,
-    downsample_factor: int = 2,
-    downsample_mode: str = "avg",
 ) -> Tuple[np.ndarray, int]:
     processed_window = window.astype(np.float32)
 
@@ -180,24 +178,6 @@ def preprocess_sample(
                 for feature_idx in range(processed_window.shape[1])
             ]
         ).T.astype(np.float32)
-
-    # Downsample either by block averaging or simple slicing.
-    if downsample_factor and downsample_factor > 1:
-        downsample_step = int(downsample_factor)
-        if downsample_mode == "avg":
-            num_timesteps, num_features = processed_window.shape
-            pad_needed = (-num_timesteps) % downsample_step
-            if pad_needed:
-                processed_window = np.concatenate(
-                    [
-                        processed_window,
-                        np.repeat(processed_window[-1:, :], pad_needed, axis=0),
-                    ],
-                    axis=0,
-                )
-            processed_window = processed_window.reshape(-1, downsample_step, num_features).mean(axis=1)
-        else:
-            processed_window = processed_window[::downsample_step]
 
     return processed_window, y
 
@@ -226,7 +206,7 @@ class IMUDataset(Dataset):
                 end_index = start_index + window_size
                 window = feature_matrix[start_index:end_index]
                 window_labels = session_labels[start_index:end_index]
-                window_label = int(np.bincount(window_labels).argmax())
+                window_label = int(np.bincount(window_labels).argmax()) #label for the window is the most common label in it
 
                 if self.preprocess_fn is not None:
                     processed_window, processed_label = self.preprocess_fn(
@@ -262,7 +242,7 @@ def stratified_session_split(
     target_train_count = int(train_ratio * len(label_array))
 
     class_counts = dict(zip(*np.unique(label_array, return_counts=True)))
-    rare_classes = {class_id for class_id, count in class_counts.items() if count < 2}
+    rare_classes = {class_id for class_id, count in class_counts.items() if count < 2} #if class has only one session it cant be stratified
 
     forced_train_indices = np.array(
         [index for index in all_session_indices if label_array[index] in rare_classes],
@@ -298,6 +278,7 @@ def stratified_session_split(
     )
     test_indices = remaining_indices[remaining_test_selection]
 
+    #check if a class is missing from train split than it is moved form test to train split
     all_present_classes = set(np.unique(label_array))
     train_present_classes = set(np.unique(label_array[train_indices]))
     classes_missing_from_train = all_present_classes - train_present_classes
@@ -320,8 +301,8 @@ def stratified_session_split(
 def make_train_test_loaders(
     data: List[pd.DataFrame],
     imu_features: Sequence[str],
-    window_size: int = 300,
-    step_size: int = 100,
+    window_size: int,
+    step_size: int,
     train_split: float = 0.8,
     batch_size_train: int = 32,
     batch_size_test: int = 1,
@@ -351,7 +332,7 @@ def make_train_test_loaders(
     _apply_scaler_inplace(train_sessions, scaler, imu_features)
     _apply_scaler_inplace(test_sessions, scaler, imu_features)
 
-    preprocess_kwargs = dict(smooth_kernel=5, downsample_factor=2, downsample_mode="avg")
+    preprocess_kwargs = dict(smooth_kernel=5)
 
     train_dataset = IMUDataset(
         dataframes=train_sessions,

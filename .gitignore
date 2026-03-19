@@ -2,5 +2,4 @@
 __pycache__/
 *.py[cod]
 
-# Large local dataset file (do not commit)
 data2/RecGym.csv

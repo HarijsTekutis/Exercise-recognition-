@@ -6,13 +6,7 @@ import torch.nn.functional as F
 class CNNLSTM_1(nn.Module):
 
     def __init__(self, num_features: int = 6, num_classes: int = 6, hidden_dim: int = 64, lstm_layers: int = 1):
-        """
-        Args:
-            num_features: Number of input sensor channels per timestep.
-            num_classes: Number of output activity classes.
-            hidden_dim: Hidden size for the BiLSTM.
-            lstm_layers: Number of stacked LSTM layers.
-        """
+     
         super().__init__()
 
         # 1D CNN feature extractor over time.
