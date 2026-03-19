@@ -9,7 +9,7 @@ import torch
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from sklearn.ensemble import RandomForestClassifier
 
-from model_architecture import CNNLSTM_1, CNNLSTM_2
+from model_architecture import CNNLSTM_1, CNNLSTM_2, MULTI_HEAD_CNN_LSTM
 from train_eval import (
     build_classification_report,
     build_training_objects,
@@ -49,6 +49,14 @@ def create_model(
         return model.to(device)
     elif architecture == "CNNLSTM_2":
         model = CNNLSTM_2(
+            num_features=num_features,
+            num_classes=num_classes,
+            hidden_dim=kwargs.get("hidden_dim", 64),
+            lstm_layers=kwargs.get("lstm_layers", 2),
+        )
+        return model.to(device)
+    elif architecture == "MULTI_HEAD_CNN_LSTM":
+        model = MULTI_HEAD_CNN_LSTM(
             num_features=num_features,
             num_classes=num_classes,
             hidden_dim=kwargs.get("hidden_dim", 64),

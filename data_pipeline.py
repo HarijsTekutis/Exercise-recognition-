@@ -18,6 +18,9 @@ IMU_FEATURES = [
     "G_x",
     "G_y",
     "G_z",
+    "body_a_x",
+    "body_a_y",
+    "body_a_z",
 ]
 
 ACTIVITY_COLUMN = "Workout"
