@@ -365,3 +365,38 @@ def make_train_test_loaders(
     ), "Leak: same session in both splits"
 
     return train_loader, test_loader, train_dataset, test_dataset
+
+
+def get_device() -> torch.device:
+    """Pick CUDA when available, otherwise run on CPU."""
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def compute_class_weights(train_dataset, num_classes: int, device: torch.device) -> torch.Tensor:
+    """Compute clipped inverse-frequency class weights from the training dataset."""
+    # Collect integer class labels from all training windows.
+    train_labels = [train_dataset[i][1].item() for i in range(len(train_dataset))]
+    class_counts = np.bincount(train_labels, minlength=num_classes)
+
+    # Avoid division by zero for classes not present in the sampled windows.
+    safe_counts = np.maximum(class_counts, 1)
+    class_weights_np = class_counts.sum() / (num_classes * safe_counts)
+
+    # Keep weights in a stable range to avoid extreme loss scaling.
+    class_weights_np = np.clip(class_weights_np, 0.5, 3.0).astype(np.float32)
+    return torch.tensor(class_weights_np, dtype=torch.float32, device=device)
+
+
+def build_training_objects(
+    model: torch.nn.Module,
+    class_weights: torch.Tensor,
+    learning_rate: float,
+    num_epochs: int,
+):
+    """Create criterion, optimizer, and scheduler used during training."""
+    criterion = torch.nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.05)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-3)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=num_epochs, eta_min=1e-6
+    )
+    return criterion, optimizer, scheduler
