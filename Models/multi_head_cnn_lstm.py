@@ -243,4 +243,57 @@ def train_multi_head_cnn_lstm(
     return history
 
 
+@torch.no_grad()
+def evaluate_multi_head_cnn_lstm(
+    model: MULTI_HEAD_CNN_LSTM,
+    data_loader,
+    device: torch.device,
+    history: Dict[str, object] = None,
+    best_model_path: str = "",
+) -> Dict[str, object]:
+    """Evaluate MULTI_HEAD_CNN_LSTM on a test loader and return metrics."""
+    from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix
+    
+    model.eval()
+    y_true = []
+    y_pred = []
+    confidences = []
+    
+    with torch.no_grad():
+        for batch_inputs, batch_labels in data_loader:
+            batch_inputs = batch_inputs.to(device)
+            logits = model(batch_inputs)
+            probs = torch.softmax(logits, dim=1)
+            preds = logits.argmax(dim=1).cpu().numpy()
+            confs = probs.max(dim=1).values.cpu().numpy()
+            
+            y_pred.extend(preds.tolist())
+            y_true.extend(batch_labels.numpy().tolist())
+                confidences.extend(confs.tolist())
+    
+    y_true = np.array(y_true, dtype=np.int64)
+    y_pred = np.array(y_pred, dtype=np.int64)
+    
+    cm = confusion_matrix(y_true, y_pred)
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="macro", zero_division=0
+    )
+    accuracy = accuracy_score(y_true, y_pred)
+    
+    result = {
+        "history": history if history is not None else {},
+        "confusion_matrix": cm.tolist(),
+        "metrics": {
+            "accuracy": float(accuracy),
+            "precision": float(precision),
+            "recall": float(recall),
+            "f1_score": float(f1),
+        },
+        "y_true": y_true.tolist(),
+        "y_pred": y_pred.tolist(),
+            "confidence": confidences,
+        "param_count": int(sum(p.numel() for p in model.parameters())),
+        "best_model_path": best_model_path,
+    }
+    return result
 
