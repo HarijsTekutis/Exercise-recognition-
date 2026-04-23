@@ -179,6 +179,9 @@ def train_cnnlstm(
         if average_validation_loss < best_validation_loss:
             best_validation_loss = average_validation_loss
             epochs_without_improvement = 0
+            checkpoint_dir = os.path.dirname(best_model_path)
+            if checkpoint_dir:
+                os.makedirs(checkpoint_dir, exist_ok=True)
             torch.save(model.state_dict(), best_model_path)
             print(f"Best model saved to {best_model_path}")
         else:
@@ -203,6 +206,12 @@ def evaluate_cnnlstm(
 ) -> Dict[str, object]:
     """Evaluate CNNLSTM on a test loader and return metrics."""
     from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix
+
+    if best_model_path and os.path.exists(best_model_path):
+        state_dict = torch.load(best_model_path, map_location=device)
+        model.load_state_dict(state_dict)
+    elif best_model_path:
+        print(f"Warning: best checkpoint not found at {best_model_path}; evaluating current model weights.")
     
     model.eval()
     y_true = []
@@ -219,7 +228,7 @@ def evaluate_cnnlstm(
             
             y_pred.extend(preds.tolist())
             y_true.extend(batch_labels.numpy().tolist())
-                confidences.extend(confs.tolist())
+            confidences.extend(confs.tolist())
     
     y_true = np.array(y_true, dtype=np.int64)
     y_pred = np.array(y_pred, dtype=np.int64)
@@ -241,7 +250,7 @@ def evaluate_cnnlstm(
         },
         "y_true": y_true.tolist(),
         "y_pred": y_pred.tolist(),
-            "confidence": confidences,
+        "confidence": confidences,
         "param_count": int(sum(p.numel() for p in model.parameters())),
         "best_model_path": best_model_path,
     }

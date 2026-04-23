@@ -3,3 +3,6 @@ __pycache__/
 *.py[cod]
 
 data2/RecGym.csv
+
+# Ignore model checkpoints
+*.pt
