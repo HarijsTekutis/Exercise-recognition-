@@ -1,30 +1,35 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Tuple
+from typing import Dict, List
 import numpy as np
 from sklearn.metrics import confusion_matrix, classification_report
 import sys
 import os
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data_pipeline import build_training_objects
 
 
-class CNNLSTM(nn.Module):
-    """
-    CNN-LSTM model for time-series classification.
-    
-    Architecture:
-    - 1D CNN feature extractor with 3 convolutional layers
-    - Bidirectional LSTM for temporal context
-    - Classification head with mean and max pooling
-    
-    Input shape: (batch, time, features)
-    Output shape: (batch, num_classes)
-    """
+class BiLSTMBlock(nn.Module):
+    def __init__(self, input_size: int, hidden_size: int):
+        super().__init__()
+        self.bilstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.0,
+        )
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out, _ = self.bilstm(x)
+        return out
+
+
+class CNNLSTM(nn.Module):
     def __init__(self, num_features: int = 9, num_classes: int = 6, hidden_dim: int = 64, lstm_layers: int = 1):
-     
         super().__init__()
 
         # 1D CNN feature extractor over time.
@@ -39,15 +44,12 @@ class CNNLSTM(nn.Module):
         self.conv3 = nn.Conv1d(128, 128, kernel_size=3, stride=1, padding=1)
         self.bn3 = nn.BatchNorm1d(128)
 
-        # Bidirectional LSTM for temporal context.
-        self.lstm = nn.LSTM(
-            input_size=128,
-            hidden_size=hidden_dim,
-            num_layers=lstm_layers,
-            batch_first=True,
-            bidirectional=True,
-            dropout=0.2
-        )
+        # Stacked bidirectional LSTM blocks for temporal context.
+        num_bilstm_blocks = max(1, lstm_layers)
+        self.bilstm_blocks = nn.ModuleList()
+        for block_index in range(num_bilstm_blocks):
+            block_input = 128 if block_index == 0 else hidden_dim * 2
+            self.bilstm_blocks.append(BiLSTMBlock(input_size=block_input, hidden_size=hidden_dim))
 
         # Classification head over pooled temporal features.
         self.dropout = nn.Dropout(0.3)
@@ -57,7 +59,7 @@ class CNNLSTM(nn.Module):
         """
         Args:
             x: Input tensor of shape (batch, time, features)
-        
+
         Returns:
             Output logits of shape (batch, num_classes)
         """
@@ -68,10 +70,12 @@ class CNNLSTM(nn.Module):
         x = self.pool2(F.relu(self.bn2(self.conv2(x))))
         x = F.relu(self.bn3(self.conv3(x)))
 
-        # LSTM expects time-first per sample: (batch, time, channels).
+        # Recurrent blocks expect time-first per sample: (batch, time, channels).
         x = x.permute(0, 2, 1)
 
-        lstm_out, _ = self.lstm(x)
+        for block in self.bilstm_blocks:
+            x = block(x)
+        lstm_out = x
 
         # Combine mean and max temporal pooling for a richer sequence summary.
         mean_pool = lstm_out.mean(dim=1)
@@ -99,7 +103,7 @@ def train_cnnlstm(
     criterion, optimizer, scheduler = build_training_objects(
         model, class_weights, learning_rate, num_epochs
     )
-    
+
     best_validation_loss = float("inf")
     epochs_without_improvement = 0
 
@@ -212,12 +216,12 @@ def evaluate_cnnlstm(
         model.load_state_dict(state_dict)
     elif best_model_path:
         print(f"Warning: best checkpoint not found at {best_model_path}; evaluating current model weights.")
-    
+
     model.eval()
     y_true = []
     y_pred = []
     confidences = []
-    
+
     with torch.no_grad():
         for batch_inputs, batch_labels in data_loader:
             batch_inputs = batch_inputs.to(device)
@@ -225,20 +229,20 @@ def evaluate_cnnlstm(
             probs = torch.softmax(logits, dim=1)
             preds = logits.argmax(dim=1).cpu().numpy()
             confs = probs.max(dim=1).values.cpu().numpy()
-            
+
             y_pred.extend(preds.tolist())
             y_true.extend(batch_labels.numpy().tolist())
             confidences.extend(confs.tolist())
-    
+
     y_true = np.array(y_true, dtype=np.int64)
     y_pred = np.array(y_pred, dtype=np.int64)
-    
+
     cm = confusion_matrix(y_true, y_pred)
     precision, recall, f1, _ = precision_recall_fscore_support(
         y_true, y_pred, average="macro", zero_division=0
     )
     accuracy = accuracy_score(y_true, y_pred)
-    
+
     result = {
         "history": history if history is not None else {},
         "confusion_matrix": cm.tolist(),

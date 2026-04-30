@@ -1,87 +1,128 @@
-import os
-import sys
-from typing import Dict, List
-
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from typing import Dict, List
+import numpy as np
+import sys
+import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data_pipeline import build_training_objects
 
 
-class ResBiGRUBlock(nn.Module):
+class ResBiLSTMBlock(nn.Module):
+    """Residual bidirectional LSTM block with skip projection."""
+
     def __init__(self, input_size: int, hidden_size: int):
         super().__init__()
-        self.bigru = nn.GRU(
+        self.bilstm = nn.LSTM(
             input_size=input_size,
             hidden_size=hidden_size,
-            bidirectional=True,
+            num_layers=1,
             batch_first=True,
+            bidirectional=True,
+            dropout=0.0,
         )
+        output_size = hidden_size * 2
         self.projection = (
-            nn.Linear(input_size, hidden_size * 2)
-            if input_size != hidden_size * 2 
+            nn.Linear(input_size, output_size)
+            if input_size != output_size
             else nn.Identity()
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = self.projection(x)
-        out, _ = self.bigru(x)
+        out, _ = self.bilstm(x)
         return out + residual
 
 
-class Model_1D_CNN_ResBiGRU(nn.Module):
+class MULTI_HEAD_CNN_LSTM(nn.Module):
+    """
+    Expected input feature order:
+    [A_x, A_y, A_z, G_x, G_y, G_z, body_a_x, body_a_y, body_a_z]
 
-    def __init__(self, num_classes: int = 6, num_features: int = 9, hidden_size: int = 64, gru_layers: int = 2):
+    Input shape: (batch, time, 9 features)
+    Output shape: (batch, num_classes)
+    """
+
+    def __init__(self, num_features: int = 9, num_classes: int = 6, hidden_dim: int = 64, lstm_layers: int = 1):
         super().__init__()
 
-        self.conv1 = nn.Conv1d(in_channels=num_features, out_channels=64, kernel_size=5, stride=1, padding=2)
-        self.bn1 = nn.BatchNorm1d(64)
-        self.pool1 = nn.MaxPool1d(kernel_size=2)
+        # Three heads:
+        # 1) Accelerometer: A_x, A_y, A_z
+        # 2) Gyroscope: G_x, G_y, G_z
+        # 3) Body acceleration: body_a_x, body_a_y, body_a_z
+        head_out_channels = 128
 
-        self.conv2 = nn.Conv1d(in_channels=64, out_channels=128, kernel_size=5, stride=1, padding=2)
-        self.bn2 = nn.BatchNorm1d(128)
-        self.pool2 = nn.MaxPool1d(kernel_size=2)
+        def create_cnn_head():
+            return nn.Sequential(
+                nn.Conv1d(in_channels=3, out_channels=64, kernel_size=5, stride=1, padding=2),
+                nn.BatchNorm1d(64),
+                nn.ReLU(),
+                nn.MaxPool1d(kernel_size=2),
+                nn.Conv1d(in_channels=64, out_channels=128, kernel_size=5, stride=1, padding=2),
+                nn.BatchNorm1d(128),
+                nn.ReLU(),
+                nn.MaxPool1d(kernel_size=2),
+                nn.Conv1d(in_channels=128, out_channels=head_out_channels, kernel_size=3, stride=1, padding=1),
+                nn.BatchNorm1d(head_out_channels),
+                nn.ReLU(),
+            )
 
-        self.conv3 = nn.Conv1d(128, 128, kernel_size=3, stride=1, padding=1)
-        self.bn3 = nn.BatchNorm1d(128)
+        self.acc_head = create_cnn_head()
+        self.gyr_head = create_cnn_head()
+        self.body_head = create_cnn_head()
 
-        self.res_bigru_blocks = nn.ModuleList()
-        self.res_bigru_blocks.append(ResBiGRUBlock(input_size=128, hidden_size=hidden_size))
-        for _ in range(1, gru_layers):
-            self.res_bigru_blocks.append(ResBiGRUBlock(input_size=hidden_size * 2, hidden_size=hidden_size))
+        lstm_input_dim = head_out_channels * 3
+        num_residual_blocks = max(1, lstm_layers)
+        self.res_bilstm_blocks = nn.ModuleList()
+        for block_index in range(num_residual_blocks):
+            block_input = lstm_input_dim if block_index == 0 else hidden_dim * 2
+            self.res_bilstm_blocks.append(
+                ResBiLSTMBlock(input_size=block_input, hidden_size=hidden_dim)
+            )
 
         self.dropout = nn.Dropout(0.3)
-        self.global_pool = nn.AdaptiveAvgPool1d(1)
-        self.fc = nn.Linear(hidden_size * 2, num_classes)
+        self.fc = nn.Linear(hidden_dim * 2 * 2, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Input from dataset: (batch, time, features)
+        """
+        Args:
+            x: Input tensor of shape (batch, time, 9 features)
+               Feature order: [A_x, A_y, A_z, G_x, G_y, G_z, body_a_x, body_a_y, body_a_z]
+
+        Returns:
+            Output logits of shape (batch, num_classes)
+        """
+        # Conv1d uses channel-first tensors.
         x = x.permute(0, 2, 1)
 
-        x = self.pool1(F.relu(self.bn1(self.conv1(x))))
-        x = self.pool2(F.relu(self.bn2(self.conv2(x))))
-        x = F.relu(self.bn3(self.conv3(x)))
+        acc_x = x[:, 0:3, :]
+        gyr_x = x[:, 3:6, :]
+        body_x = x[:, 6:9, :]
 
-        # (batch, time, channels)
-        x = x.permute(0, 2, 1)
-        for res_bigru in self.res_bigru_blocks:
-            x = res_bigru(x)
+        acc_feat = self.acc_head(acc_x)
+        gyr_feat = self.gyr_head(gyr_x)
+        body_feat = self.body_head(body_x)
 
-        # AdaptiveAvgPool1d expects channel-first.
-        x = x.permute(0, 2, 1)
-        x = self.global_pool(x).flatten(1)
-        x = self.dropout(x)
-        return self.fc(x)
+        fused = torch.cat([acc_feat, gyr_feat, body_feat], dim=1)
+
+        # Recurrent blocks expect (batch, time, channels).
+        fused = fused.permute(0, 2, 1)
+        for block in self.res_bilstm_blocks:
+            fused = block(fused)
+        lstm_out = fused
+
+        mean_pool = lstm_out.mean(dim=1)
+        max_pool, _ = lstm_out.max(dim=1)
+        out = torch.cat([mean_pool, max_pool], dim=1)
+
+        out = self.dropout(out)
+        out = self.fc(out)
+        return out
 
 
-CNNResBiGRU = Model_1D_CNN_ResBiGRU
-
-
-def train_cnn_resbigru(
-    model: Model_1D_CNN_ResBiGRU,
+def train_multi_head_cnn_lstm(
+    model: MULTI_HEAD_CNN_LSTM,
     train_loader,
     val_loader,
     class_weights: torch.Tensor,
@@ -90,9 +131,9 @@ def train_cnn_resbigru(
     num_epochs: int = 50,
     clip_grad_norm: float = 1.0,
     patience: int = 7,
-    best_model_path: str = "CNN_ResBiGRU.pt",
+    best_model_path: str = "multi_head_CNN_LSTM.pt",
 ) -> Dict[str, List[float]]:
-    
+    """Train MULTI_HEAD_CNN_LSTM with validation and early stopping."""
     criterion, optimizer, scheduler = build_training_objects(
         model, class_weights, learning_rate, num_epochs
     )
@@ -109,9 +150,9 @@ def train_cnn_resbigru(
 
     for epoch in range(num_epochs):
         model.train()
-        running_loss = 0.0
         correct_predictions = 0
         total_examples = 0
+        running_loss = 0.0
 
         for batch_inputs, batch_labels in train_loader:
             batch_inputs = batch_inputs.to(device)
@@ -191,15 +232,21 @@ def train_cnn_resbigru(
 
 
 @torch.no_grad()
-def evaluate_cnn_resbigru(
-    model: Model_1D_CNN_ResBiGRU,
+def evaluate_multi_head_cnn_lstm(
+    model: MULTI_HEAD_CNN_LSTM,
     data_loader,
     device: torch.device,
     history: Dict[str, object] = None,
     best_model_path: str = "",
 ) -> Dict[str, object]:
-    """Evaluate CNN-ResBiGRU on a loader and return standard metrics."""
-    from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_fscore_support
+    """Evaluate MULTI_HEAD_CNN_LSTM on a test loader and return metrics."""
+    from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix
+
+    if best_model_path and os.path.exists(best_model_path):
+        state_dict = torch.load(best_model_path, map_location=device)
+        model.load_state_dict(state_dict)
+    elif best_model_path:
+        print(f"Warning: best checkpoint not found at {best_model_path}; evaluating current model weights.")
 
     model.eval()
     y_true = []
@@ -227,7 +274,7 @@ def evaluate_cnn_resbigru(
     )
     accuracy = accuracy_score(y_true, y_pred)
 
-    return {
+    result = {
         "history": history if history is not None else {},
         "confusion_matrix": cm.tolist(),
         "metrics": {
@@ -242,3 +289,4 @@ def evaluate_cnn_resbigru(
         "param_count": int(sum(p.numel() for p in model.parameters())),
         "best_model_path": best_model_path,
     }
+    return result

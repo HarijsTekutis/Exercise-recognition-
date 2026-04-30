@@ -1,42 +1,57 @@
-import os
-import sys
-from typing import Dict, List
-
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from typing import Dict, List, Tuple
+import numpy as np
+from sklearn.metrics import confusion_matrix, classification_report
+import sys
+import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data_pipeline import build_training_objects
 
 
-class ResBiGRUBlock(nn.Module):
-    def __init__(self, input_size: int, hidden_size: int):
+class ResBiLSTMBlock(nn.Module):
+    """Residual bidirectional LSTM block with optional skip projection."""
+
+    def __init__(self, input_size: int, hidden_size: int, dropout: float = 0.2):
         super().__init__()
-        self.bigru = nn.GRU(
+        self.bilstm = nn.LSTM(
             input_size=input_size,
             hidden_size=hidden_size,
-            bidirectional=True,
+            num_layers=1,
             batch_first=True,
+            bidirectional=True,
+            dropout=0.0,
         )
+        output_size = hidden_size * 2
         self.projection = (
-            nn.Linear(input_size, hidden_size * 2)
-            if input_size != hidden_size * 2 
-            else nn.Identity()
+            nn.Linear(input_size, output_size) if input_size != output_size else nn.Identity()
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = self.projection(x)
-        out, _ = self.bigru(x)
+        out, _ = self.bilstm(x)
         return out + residual
 
 
-class Model_1D_CNN_ResBiGRU(nn.Module):
+class CNNLSTM(nn.Module):
+    """
+    CNN-LSTM model for time-series classification.
+    
+    Architecture:
+    - 1D CNN feature extractor with 3 convolutional layers
+    - Stacked residual bidirectional LSTM blocks for temporal context
+    - Classification head with mean and max pooling
+    
+    Input shape: (batch, time, features)
+    Output shape: (batch, num_classes)
+    """
 
-    def __init__(self, num_classes: int = 6, num_features: int = 9, hidden_size: int = 64, gru_layers: int = 2):
+    def __init__(self, num_features: int = 9, num_classes: int = 6, hidden_dim: int = 64, lstm_layers: int = 1):
+     
         super().__init__()
 
+        # 1D CNN feature extractor over time.
         self.conv1 = nn.Conv1d(in_channels=num_features, out_channels=64, kernel_size=5, stride=1, padding=2)
         self.bn1 = nn.BatchNorm1d(64)
         self.pool1 = nn.MaxPool1d(kernel_size=2)
@@ -48,40 +63,53 @@ class Model_1D_CNN_ResBiGRU(nn.Module):
         self.conv3 = nn.Conv1d(128, 128, kernel_size=3, stride=1, padding=1)
         self.bn3 = nn.BatchNorm1d(128)
 
-        self.res_bigru_blocks = nn.ModuleList()
-        self.res_bigru_blocks.append(ResBiGRUBlock(input_size=128, hidden_size=hidden_size))
-        for _ in range(1, gru_layers):
-            self.res_bigru_blocks.append(ResBiGRUBlock(input_size=hidden_size * 2, hidden_size=hidden_size))
+        # Residual bidirectional LSTM blocks for temporal context.
+        num_residual_blocks = max(1, lstm_layers)
+        self.res_bilstm_blocks = nn.ModuleList()
+        for block_index in range(num_residual_blocks):
+            block_input = 128 if block_index == 0 else hidden_dim * 2
+            self.res_bilstm_blocks.append(
+                ResBiLSTMBlock(input_size=block_input, hidden_size=hidden_dim, dropout=0.2)
+            )
 
+        # Classification head over pooled temporal features.
         self.dropout = nn.Dropout(0.3)
-        self.global_pool = nn.AdaptiveAvgPool1d(1)
-        self.fc = nn.Linear(hidden_size * 2, num_classes)
+        self.fc = nn.Linear(hidden_dim * 2 * 2, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Input from dataset: (batch, time, features)
+        """
+        Args:
+            x: Input tensor of shape (batch, time, features)
+        
+        Returns:
+            Output logits of shape (batch, num_classes)
+        """
+        # Conv1d expects channel-first: (batch, features, time).
         x = x.permute(0, 2, 1)
 
         x = self.pool1(F.relu(self.bn1(self.conv1(x))))
         x = self.pool2(F.relu(self.bn2(self.conv2(x))))
         x = F.relu(self.bn3(self.conv3(x)))
 
-        # (batch, time, channels)
+        # LSTM expects time-first per sample: (batch, time, channels).
         x = x.permute(0, 2, 1)
-        for res_bigru in self.res_bigru_blocks:
-            x = res_bigru(x)
 
-        # AdaptiveAvgPool1d expects channel-first.
-        x = x.permute(0, 2, 1)
-        x = self.global_pool(x).flatten(1)
-        x = self.dropout(x)
-        return self.fc(x)
+        for block in self.res_bilstm_blocks:
+            x = block(x)
+        lstm_out = x
+
+        # Combine mean and max temporal pooling for a richer sequence summary.
+        mean_pool = lstm_out.mean(dim=1)
+        max_pool, _ = lstm_out.max(dim=1)
+        out = torch.cat([mean_pool, max_pool], dim=1)
+
+        out = self.dropout(out)
+        out = self.fc(out)
+        return out
 
 
-CNNResBiGRU = Model_1D_CNN_ResBiGRU
-
-
-def train_cnn_resbigru(
-    model: Model_1D_CNN_ResBiGRU,
+def train_cnnlstm(
+    model: CNNLSTM,
     train_loader,
     val_loader,
     class_weights: torch.Tensor,
@@ -90,13 +118,13 @@ def train_cnn_resbigru(
     num_epochs: int = 50,
     clip_grad_norm: float = 1.0,
     patience: int = 7,
-    best_model_path: str = "CNN_ResBiGRU.pt",
+    best_model_path: str = "CNN_LSTM.pt",
 ) -> Dict[str, List[float]]:
-    
+    """Train CNNLSTM with built training objects."""
     criterion, optimizer, scheduler = build_training_objects(
         model, class_weights, learning_rate, num_epochs
     )
-
+    
     best_validation_loss = float("inf")
     epochs_without_improvement = 0
 
@@ -108,10 +136,11 @@ def train_cnn_resbigru(
     }
 
     for epoch in range(num_epochs):
+        # Training phase
         model.train()
-        running_loss = 0.0
         correct_predictions = 0
         total_examples = 0
+        running_loss = 0.0
 
         for batch_inputs, batch_labels in train_loader:
             batch_inputs = batch_inputs.to(device)
@@ -144,6 +173,7 @@ def train_cnn_resbigru(
             f"Epoch {epoch}: loss={average_train_loss:.4f}, accuracy={train_accuracy:.2f}%, lr={current_lr:.2e}"
         )
 
+        # Validation phase
         model.eval()
         validation_loss_sum = 0.0
         validation_correct = 0
@@ -170,6 +200,7 @@ def train_cnn_resbigru(
 
         print(f"Validation: loss={average_validation_loss:.4f}, accuracy={validation_accuracy:.2f}%")
 
+        # Early stopping
         if average_validation_loss < best_validation_loss:
             best_validation_loss = average_validation_loss
             epochs_without_improvement = 0
@@ -191,21 +222,27 @@ def train_cnn_resbigru(
 
 
 @torch.no_grad()
-def evaluate_cnn_resbigru(
-    model: Model_1D_CNN_ResBiGRU,
+def evaluate_cnnlstm(
+    model: CNNLSTM,
     data_loader,
     device: torch.device,
     history: Dict[str, object] = None,
     best_model_path: str = "",
 ) -> Dict[str, object]:
-    """Evaluate CNN-ResBiGRU on a loader and return standard metrics."""
-    from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_fscore_support
+    """Evaluate CNNLSTM on a test loader and return metrics."""
+    from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix
 
+    if best_model_path and os.path.exists(best_model_path):
+        state_dict = torch.load(best_model_path, map_location=device)
+        model.load_state_dict(state_dict)
+    elif best_model_path:
+        print(f"Warning: best checkpoint not found at {best_model_path}; evaluating current model weights.")
+    
     model.eval()
     y_true = []
     y_pred = []
     confidences = []
-
+    
     with torch.no_grad():
         for batch_inputs, batch_labels in data_loader:
             batch_inputs = batch_inputs.to(device)
@@ -213,21 +250,21 @@ def evaluate_cnn_resbigru(
             probs = torch.softmax(logits, dim=1)
             preds = logits.argmax(dim=1).cpu().numpy()
             confs = probs.max(dim=1).values.cpu().numpy()
-
+            
             y_pred.extend(preds.tolist())
             y_true.extend(batch_labels.numpy().tolist())
             confidences.extend(confs.tolist())
-
+    
     y_true = np.array(y_true, dtype=np.int64)
     y_pred = np.array(y_pred, dtype=np.int64)
-
+    
     cm = confusion_matrix(y_true, y_pred)
     precision, recall, f1, _ = precision_recall_fscore_support(
         y_true, y_pred, average="macro", zero_division=0
     )
     accuracy = accuracy_score(y_true, y_pred)
-
-    return {
+    
+    result = {
         "history": history if history is not None else {},
         "confusion_matrix": cm.tolist(),
         "metrics": {
@@ -242,3 +279,4 @@ def evaluate_cnn_resbigru(
         "param_count": int(sum(p.numel() for p in model.parameters())),
         "best_model_path": best_model_path,
     }
+    return result

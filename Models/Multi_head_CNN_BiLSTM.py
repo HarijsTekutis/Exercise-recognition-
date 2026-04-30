@@ -11,6 +11,23 @@ from data_pipeline import build_training_objects
 
 
 
+class BiLSTMBlock(nn.Module):
+    def __init__(self, input_size: int, hidden_size: int):
+        super().__init__()
+        self.bilstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.0,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out, _ = self.bilstm(x)
+        return out
+
+
 class MULTI_HEAD_CNN_LSTM(nn.Module):
     """
     
@@ -28,47 +45,33 @@ class MULTI_HEAD_CNN_LSTM(nn.Module):
         # 1) Accelerometer: A_x, A_y, A_z
         # 2) Gyroscope: G_x, G_y, G_z
         # 3) Body acceleration: body_a_x, body_a_y, body_a_z
-        head_out_channels = 64
+        head_out_channels = 128
 
-        self.acc_head = nn.Sequential(
-            nn.Conv1d(in_channels=3, out_channels=head_out_channels, kernel_size=5, stride=1, padding=2),
-            nn.BatchNorm1d(head_out_channels),
-            nn.ReLU(),
-            nn.MaxPool1d(kernel_size=2),
-            nn.Conv1d(in_channels=head_out_channels, out_channels=head_out_channels, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm1d(head_out_channels),
-            nn.ReLU(),
-        )
+        def create_cnn_head():
+            return nn.Sequential(
+                nn.Conv1d(in_channels=3, out_channels=64, kernel_size=5, stride=1, padding=2),
+                nn.BatchNorm1d(64),
+                nn.ReLU(),
+                nn.MaxPool1d(kernel_size=2),
+                nn.Conv1d(in_channels=64, out_channels=128, kernel_size=5, stride=1, padding=2),
+                nn.BatchNorm1d(128),
+                nn.ReLU(),
+                nn.MaxPool1d(kernel_size=2),
+                nn.Conv1d(in_channels=128, out_channels=head_out_channels, kernel_size=3, stride=1, padding=1),
+                nn.BatchNorm1d(head_out_channels),
+                nn.ReLU(),
+            )
 
-        self.gyr_head = nn.Sequential(
-            nn.Conv1d(in_channels=3, out_channels=head_out_channels, kernel_size=5, stride=1, padding=2),
-            nn.BatchNorm1d(head_out_channels),
-            nn.ReLU(),
-            nn.MaxPool1d(kernel_size=2),
-            nn.Conv1d(in_channels=head_out_channels, out_channels=head_out_channels, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm1d(head_out_channels),
-            nn.ReLU(),
-        )
-
-        self.body_head = nn.Sequential(
-            nn.Conv1d(in_channels=3, out_channels=head_out_channels, kernel_size=5, stride=1, padding=2),
-            nn.BatchNorm1d(head_out_channels),
-            nn.ReLU(),
-            nn.MaxPool1d(kernel_size=2),
-            nn.Conv1d(in_channels=head_out_channels, out_channels=head_out_channels, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm1d(head_out_channels),
-            nn.ReLU(),
-        )
+        self.acc_head = create_cnn_head()
+        self.gyr_head = create_cnn_head()
+        self.body_head = create_cnn_head()
 
         lstm_input_dim = head_out_channels * 3
-        self.shared_lstm = nn.LSTM(
-            input_size=lstm_input_dim,
-            hidden_size=hidden_dim,
-            num_layers=lstm_layers,
-            batch_first=True,
-            bidirectional=True,
-            dropout=0.2 if lstm_layers > 1 else 0.0,
-        )
+        num_bilstm_blocks = max(1, lstm_layers)
+        self.bilstm_blocks = nn.ModuleList()
+        for block_index in range(num_bilstm_blocks):
+            block_input = lstm_input_dim if block_index == 0 else hidden_dim * 2
+            self.bilstm_blocks.append(BiLSTMBlock(input_size=block_input, hidden_size=hidden_dim))
 
         self.dropout = nn.Dropout(0.3)
         self.fc = nn.Linear(hidden_dim * 2 * 2, num_classes)
@@ -96,9 +99,11 @@ class MULTI_HEAD_CNN_LSTM(nn.Module):
 
         fused = torch.cat([acc_feat, gyr_feat, body_feat], dim=1)
 
-        # LSTM expects (batch, time, channels).
+        # Recurrent blocks expect (batch, time, channels).
         fused = fused.permute(0, 2, 1)
-        lstm_out, _ = self.shared_lstm(fused)
+        for block in self.bilstm_blocks:
+            fused = block(fused)
+        lstm_out = fused
 
         mean_pool = lstm_out.mean(dim=1)
         max_pool, _ = lstm_out.max(dim=1)
