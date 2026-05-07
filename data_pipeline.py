@@ -359,7 +359,7 @@ def make_train_test_loaders(
     train_loader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size_test, shuffle=False)
 
-    # Extra safety check: no session appears in both splits.
+    # This verifies that no dataframe memory object exists in both the train and test data splits.
     assert set(map(id, train_sessions)).isdisjoint(
         set(map(id, test_sessions))
     ), "Leak: same session in both splits"

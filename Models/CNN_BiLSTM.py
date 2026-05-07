@@ -29,7 +29,7 @@ class BiLSTMBlock(nn.Module):
 
 
 class CNNLSTM(nn.Module):
-    def __init__(self, num_features: int = 9, num_classes: int = 6, hidden_dim: int = 64, lstm_layers: int = 1):
+    def __init__(self, num_features: int = 9, num_classes: int = 6, hidden_dim: int = 64, lstm_layers: int = 2):
         super().__init__()
 
         # 1D CNN feature extractor over time.

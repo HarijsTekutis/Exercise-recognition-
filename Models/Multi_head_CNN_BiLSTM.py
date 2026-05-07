@@ -38,7 +38,7 @@ class MULTI_HEAD_CNN_LSTM(nn.Module):
     Output shape: (batch, num_classes)
     """
     
-    def __init__(self, num_features: int = 9, num_classes: int = 6, hidden_dim: int = 64, lstm_layers: int = 1):
+    def __init__(self, num_features: int = 9, num_classes: int = 6, hidden_dim: int = 64, lstm_layers: int = 2):
         super().__init__()
 
         # Three heads:

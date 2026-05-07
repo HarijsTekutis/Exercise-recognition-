@@ -14,26 +14,44 @@ class ResBiLSTMBlock(nn.Module):
 
     def __init__(self, input_size: int, hidden_size: int):
         super().__init__()
-        self.bilstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=1,
-            batch_first=True,
-            bidirectional=True,
-            dropout=0.0,
-        )
-        output_size = hidden_size * 2
-        self.projection = (
-            nn.Linear(input_size, output_size)
-            if input_size != output_size
+        self.hidden_size = hidden_size
+
+        # Per-direction input size:
+        # - first block: both directions receive the full CNN output
+        # - later blocks: each direction receives its own half (hidden_size)
+        per_dir = input_size if input_size != hidden_size * 2 else hidden_size
+
+        self.lstm_f = nn.LSTM(per_dir, hidden_size, batch_first=True)
+        self.lstm_b = nn.LSTM(per_dir, hidden_size, batch_first=True)
+
+        self.proj = (
+            nn.Linear(per_dir, hidden_size)
+            if per_dir != hidden_size
             else nn.Identity()
         )
-        self.layer_norm = nn.LayerNorm(output_size)
+
+        self.ln_f = nn.LayerNorm(hidden_size)   # one LN per direction
+        self.ln_b = nn.LayerNorm(hidden_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = self.projection(x)
-        out, _ = self.bilstm(x)
-        return self.layer_norm(out + residual)
+        if x.shape[-1] == self.hidden_size * 2:
+            # layers 2+: split into the two per-direction streams
+            x_f = x[..., :self.hidden_size]
+            x_b = x[..., self.hidden_size:]
+        else:
+            # first layer: both directions share the same input
+            x_f = x_b = x
+
+        # Forward direction (left → right)
+        out_f, _ = self.lstm_f(x_f)
+        h_f = self.ln_f(self.proj(x_f) + out_f)
+
+        # Backward direction (right → left, then flip back)
+        out_b, _ = self.lstm_b(torch.flip(x_b, dims=[1]))
+        out_b = torch.flip(out_b, dims=[1])
+        h_b = self.ln_b(self.proj(x_b) + out_b)
+
+        return torch.cat([h_f, h_b], dim=-1)
 
 
 class MULTI_HEAD_CNN_LSTM(nn.Module):
@@ -45,7 +63,7 @@ class MULTI_HEAD_CNN_LSTM(nn.Module):
     Output shape: (batch, num_classes)
     """
 
-    def __init__(self, num_features: int = 9, num_classes: int = 6, hidden_dim: int = 64, lstm_layers: int = 1):
+    def __init__(self, num_features: int = 9, num_classes: int = 6, hidden_dim: int = 64, lstm_layers: int = 2):
         super().__init__()
 
         # Three heads:

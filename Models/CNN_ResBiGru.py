@@ -14,23 +14,44 @@ from data_pipeline import build_training_objects
 class ResBiGRUBlock(nn.Module):
     def __init__(self, input_size: int, hidden_size: int):
         super().__init__()
-        self.bigru = nn.GRU(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            bidirectional=True,
-            batch_first=True,
-        )
-        self.projection = (
-            nn.Linear(input_size, hidden_size * 2)
-            if input_size != hidden_size * 2 
+        self.hidden_size = hidden_size
+
+        # Per-direction input size:
+        # - first block: both directions receive the full CNN output (input_size=128)
+        # - later blocks: each direction receives its own half (hidden_size=64)
+        per_dir = input_size if input_size != hidden_size * 2 else hidden_size
+
+        self.gru_f = nn.GRU(per_dir, hidden_size, batch_first=True)
+        self.gru_b = nn.GRU(per_dir, hidden_size, batch_first=True)
+
+        self.proj = (
+            nn.Linear(per_dir, hidden_size)
+            if per_dir != hidden_size
             else nn.Identity()
         )
-        self.layer_norm = nn.LayerNorm(hidden_size * 2)
+
+        self.ln_f = nn.LayerNorm(hidden_size)   # one LN per direction
+        self.ln_b = nn.LayerNorm(hidden_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = self.projection(x)
-        out, _ = self.bigru(x)
-        return self.layer_norm(out + residual)
+        if x.shape[-1] == self.hidden_size * 2:
+            # layers 2+: split into the two per-direction streams
+            x_f = x[..., :self.hidden_size]
+            x_b = x[..., self.hidden_size:]
+        else:
+            # first layer: both directions share the same input
+            x_f = x_b = x
+
+        # Forward direction (left → right)
+        out_f, _ = self.gru_f(x_f)
+        h_f = self.ln_f(self.proj(x_f) + out_f)
+
+        # Backward direction (right → left, then flip back)
+        out_b, _ = self.gru_b(torch.flip(x_b, dims=[1]))
+        out_b = torch.flip(out_b, dims=[1])
+        h_b = self.ln_b(self.proj(x_b) + out_b)
+
+        return torch.cat([h_f, h_b], dim=-1)
 
 
 class Model_1D_CNN_ResBiGRU(nn.Module):
