@@ -143,7 +143,7 @@ def evaluate_rocket(
 	del device
 
 	print("Evaluating ROCKET model...")
-	x, y_true = _collect_from_loader(data_loader, desc="Test data")
+	x, y_true = _collect_from_loader(data_loader)
 	print(f"Loaded {len(x)} test samples")
 	
 	print("Making predictions...")

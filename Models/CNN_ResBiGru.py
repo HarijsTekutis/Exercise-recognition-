@@ -25,11 +25,12 @@ class ResBiGRUBlock(nn.Module):
             if input_size != hidden_size * 2 
             else nn.Identity()
         )
+        self.layer_norm = nn.LayerNorm(hidden_size * 2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = self.projection(x)
         out, _ = self.bigru(x)
-        return out + residual
+        return self.layer_norm(out + residual)
 
 
 class Model_1D_CNN_ResBiGRU(nn.Module):

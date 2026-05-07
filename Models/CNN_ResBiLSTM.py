@@ -27,11 +27,12 @@ class ResBiLSTMBlock(nn.Module):
         self.projection = (
             nn.Linear(input_size, output_size) if input_size != output_size else nn.Identity()
         )
+        self.layer_norm = nn.LayerNorm(output_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = self.projection(x)
         out, _ = self.bilstm(x)
-        return out + residual
+        return self.layer_norm(out + residual)
 
 
 class CNNLSTM(nn.Module):
