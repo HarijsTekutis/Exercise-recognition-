@@ -6,3 +6,12 @@ data2/RecGym.csv
 
 # Ignore model checkpoints
 *.pt
+
+# Added by Copilot for safe push
+data/
+data2/
+*.csv
+*.pth
+model_comparison_results_*/
+.venv/
+.ipynb_checkpoints/
