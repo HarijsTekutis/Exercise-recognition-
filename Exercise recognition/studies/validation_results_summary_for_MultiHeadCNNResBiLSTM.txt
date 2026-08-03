@@ -1,0 +1,16 @@
+
+==================================
+FINAL VALIDATION RESULTS FOR MultiHeadCNNResBiLSTM (Highest Average Wins):
+- {'batch_size': 128, 'lstm_layers': 6}
+      Avg F1: 0.8962  |  Std Dev: 0.0111
+      Individual Runs: [0.8817, 0.8929, 0.9117, 0.9061, 0.8888]
+- {'batch_size': 128, 'lstm_layers': 4}
+      Avg F1: 0.9026  |  Std Dev: 0.0073
+      Individual Runs: [0.9105, 0.8909, 0.9079, 0.8975, 0.9062]
+- {'batch_size': 128, 'lstm_layers': 5}
+      Avg F1: 0.8780  |  Std Dev: 0.0232
+      Individual Runs: [0.8977, 0.9064, 0.8836, 0.8489, 0.8533]
+
+🏆 REAL WINNER: {'batch_size': 128, 'lstm_layers': 4} 🏆
+With an average F1 score of 0.9026 across 5 runs.
+==================================

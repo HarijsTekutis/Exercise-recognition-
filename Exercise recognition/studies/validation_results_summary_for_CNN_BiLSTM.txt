@@ -1,0 +1,16 @@
+
+==================================
+FINAL VALIDATION RESULTS FOR CNN_BiLSTM (Highest Average Wins):
+- {'batch_size': 256, 'lstm_layers': 3}
+      Avg F1: 0.8852  |  Std Dev: 0.0143
+      Individual Runs: [0.9007, 0.8607, 0.8977, 0.8806, 0.8863]
+- {'batch_size': 256, 'lstm_layers': 2}
+      Avg F1: 0.8954  |  Std Dev: 0.0117
+      Individual Runs: [0.8766, 0.9125, 0.8920, 0.8952, 0.9008]
+- {'batch_size': 256, 'lstm_layers': 4}
+      Avg F1: 0.8926  |  Std Dev: 0.0125
+      Individual Runs: [0.9067, 0.9078, 0.8812, 0.8779, 0.8897]
+
+🏆 REAL WINNER: {'batch_size': 256, 'lstm_layers': 2} 🏆
+With an average F1 score of 0.8954 across 5 runs.
+==================================

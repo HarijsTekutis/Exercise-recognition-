@@ -15,3 +15,5 @@ data2/
 model_comparison_results_*/
 .venv/
 .ipynb_checkpoints/
+tmp*/
+.cache/
