@@ -18,8 +18,9 @@ CONFIG = {
     "data_path": "data2",
     "window_size": 40,
     "step_size": 20,
-    "train_split": 0.8,
-    "batch_size_test": 1,
+    "train_ratio": 0.6,   # subjects, not sessions; the remaining 0.2 becomes the test split
+    "val_ratio": 0.2,
+    "batch_size_eval": 1,
     "num_epochs": 50,
     "learning_rate": 2e-4,
     "clip_grad_norm": 1.0,
@@ -41,17 +42,19 @@ def objective(trial):
     # optionally you can easily add hidden_dim/hidden_size here
     
     # Reload loaders for the new batch size
-    train_loader, test_loader, train_dataset, test_dataset = dp.make_train_test_loaders(
+    splits = dp.make_train_val_test_loaders(
         data=data,
         imu_features=dp.IMU_FEATURES,
         window_size=CONFIG["window_size"],
         step_size=CONFIG["step_size"],
-        train_split=CONFIG["train_split"],
+        train_ratio=CONFIG["train_ratio"],
+        val_ratio=CONFIG["val_ratio"],
         batch_size_train=batch_size,
-        batch_size_test=CONFIG["batch_size_test"],
+        batch_size_val=CONFIG["batch_size_eval"],
+        batch_size_test=CONFIG["batch_size_eval"],
     )
 
-    class_weights = dp.compute_class_weights(train_dataset, num_classes, device)
+    class_weights = dp.compute_class_weights(splits.train_dataset, num_classes, device)
 
     # Initialize model
     model = CNNBiGRU(
@@ -64,8 +67,8 @@ def objective(trial):
     # Setup train arguments
     train_kwargs = {
         "model": model,
-        "train_loader": train_loader,
-        "val_loader": test_loader,
+        "train_loader": splits.train_loader,
+        "val_loader": splits.val_loader,
         "device": device,
         "learning_rate": CONFIG["learning_rate"],
         "num_epochs": CONFIG["num_epochs"],
@@ -86,19 +89,20 @@ def objective(trial):
     if tmp_path.exists():
         model.load_state_dict(torch.load(tmp_path, map_location=device))
 
-    # Evaluate to get the F1 score
+    # Score the trial on VALIDATION. The test split stays untouched until the search is
+    # over - optimizing against it would make the final number meaningless.
     eval_result = evaluate_cnn_bigru(
         model=model,
-        data_loader=test_loader,
+        data_loader=splits.val_loader,
         device=device,
         history=history,
         best_model_path=str(tmp_path)
     )
-    
-    best_f1 = eval_result["metrics"]["f1_score"]
+
+    val_f1 = eval_result["metrics"]["f1_score"]
     trial.set_user_attr("history", history)
-    
-    return best_f1
+
+    return val_f1
 
 def save_best_model_callback(study, trial):
     if study.best_trial.number == trial.number:
@@ -111,9 +115,9 @@ def save_best_model_callback(study, trial):
 if __name__ == "__main__":
     optuna_dir = Path("studies/optuna_optimize_CNN_BiGRU")
     optuna_dir.mkdir(parents=True, exist_ok=True)
-    db_path = f"sqlite:///{optuna_dir}/study.db"
+    db_path = f"sqlite:///{optuna_dir}/study_subject_independent.db"
 
-    study = optuna.create_study(direction="maximize", study_name="optimize_CNN_BiGRU", storage=db_path, load_if_exists=True)
+    study = optuna.create_study(direction="maximize", study_name="optimize_CNN_BiGRU_subject_independent", storage=db_path, load_if_exists=True)
     
     try:
         study.optimize(objective, n_trials=15, callbacks=[save_best_model_callback])
@@ -124,7 +128,7 @@ if __name__ == "__main__":
     print("\n===============================")
     print("Best parameters for CNN_BiGRU:")
     print(study.best_params)
-    print("Best Validation Accuracy:")
+    print("Best VALIDATION F1 reached during the search:")
     print(study.best_value)
 
     best_trial = study.best_trial
@@ -132,14 +136,16 @@ if __name__ == "__main__":
     best_gru_layers = best_trial.params["gru_layers"]
     history = best_trial.user_attrs.get("history")
 
-    train_loader, test_loader, train_dataset, test_dataset = dp.make_train_test_loaders(
+    splits = dp.make_train_val_test_loaders(
         data=data,
         imu_features=dp.IMU_FEATURES,
         window_size=CONFIG["window_size"],
         step_size=CONFIG["step_size"],
-        train_split=CONFIG["train_split"],
+        train_ratio=CONFIG["train_ratio"],
+        val_ratio=CONFIG["val_ratio"],
         batch_size_train=best_batch_size,
-        batch_size_test=CONFIG["batch_size_test"],
+        batch_size_val=CONFIG["batch_size_eval"],
+        batch_size_test=CONFIG["batch_size_eval"],
     )
 
     model = CNNBiGRU(
@@ -152,29 +158,52 @@ if __name__ == "__main__":
     best_model_path = str(optuna_dir / "best_model.pt")
     if Path(best_model_path).exists():
         model.load_state_dict(torch.load(best_model_path, map_location=device))
-    
-    eval_result = evaluate_cnn_bigru(
+
+    val_result = evaluate_cnn_bigru(
         model=model,
-        data_loader=test_loader,
+        data_loader=splits.val_loader,
         device=device,
         history=history,
         best_model_path=best_model_path,
     )
-    
-    results = {"CNN_BiGRU": eval_result}
-    serializable = {}
-    for arch, result in results.items():
-        serializable[arch] = {
-            "history": result["history"],
-            "confusion_matrix": result["confusion_matrix"],
-            "metrics": result["metrics"],
-            "y_true": result["y_true"],
-            "y_pred": result["y_pred"],
-            "param_count": result["param_count"],
-            "best_model_path": result["best_model_path"],
-            "best_params": study.best_params
+
+    # The single look at the test subjects. Hyperparameters are frozen by this point,
+    # so this is the number to report.
+    test_result = evaluate_cnn_bigru(
+        model=model,
+        data_loader=splits.test_loader,
+        device=device,
+        history=history,
+        best_model_path=best_model_path,
+    )
+
+    print(f"Validation F1 of selected model: {val_result['metrics']['f1_score']:.4f}")
+    print(f"TEST F1 (report this one):       {test_result['metrics']['f1_score']:.4f}")
+
+    # Top-level keys hold the TEST scores so downstream analysis reads the honest number;
+    # the validation scores that actually drove the search sit next to them.
+    serializable = {
+        "CNN_BiGRU": {
+            "history": history,
+            "confusion_matrix": test_result["confusion_matrix"],
+            "metrics": test_result["metrics"],
+            "y_true": test_result["y_true"],
+            "y_pred": test_result["y_pred"],
+            "param_count": test_result["param_count"],
+            "best_model_path": test_result["best_model_path"],
+            "best_params": study.best_params,
+            "val_metrics": val_result["metrics"],
+            "val_confusion_matrix": val_result["confusion_matrix"],
+            "best_val_f1_during_search": study.best_value,
+            "split": {
+                "type": "subject_independent",
+                "train_ratio": CONFIG["train_ratio"],
+                "val_ratio": CONFIG["val_ratio"],
+                "subjects": splits.subjects,
+            },
         }
-    
+    }
+
     results_path = optuna_dir / "results.json"
     with open(results_path, "w", encoding="utf-8") as f:
         json.dump(serializable, f, indent=2)

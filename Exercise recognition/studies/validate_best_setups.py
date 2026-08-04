@@ -17,8 +17,9 @@ CONFIG = {
     "data_path": "data2",
     "window_size": 40,
     "step_size": 20,
-    "train_split": 0.8,
-    "batch_size_test": 1,
+    "train_ratio": 0.6,   # subjects, not sessions; the remaining 0.2 becomes the test split
+    "val_ratio": 0.2,
+    "batch_size_eval": 1,
     "num_epochs": 50,
     "learning_rate": 2e-4,
     "clip_grad_norm": 1.0,
@@ -39,7 +40,7 @@ def main():
     # Single model: CNN_ResBiLSTM
     model_config = {
         "model_name": "CNN_ResBiLSTM",
-        "study_name": "optimize_CNN_ResBiLSTM",
+        "study_name": "optimize_CNN_ResBiLSTM_subject_independent",
         "optuna_dir": Path("studies/optuna_optimize_CNN_ResBiLSTM"),
         "model_class": CNNResBiLSTM,
         "train_fn": train_cnn_resbilstm,
@@ -52,7 +53,7 @@ def main():
     print(f"{'#'*50}\n")
 
     optuna_dir = model_config["optuna_dir"]
-    db_path = f"sqlite:///{optuna_dir}/study.db"
+    db_path = f"sqlite:///{optuna_dir}/study_subject_independent.db"
 
     print(f"Loading Optuna study from {db_path}...")
     study = optuna.load_study(study_name=model_config["study_name"], storage=db_path)
@@ -81,19 +82,22 @@ def main():
         batch_size = setup.get("batch_size")
         lstm_layers = setup.get("lstm_layers")
 
-        f1_scores = []
+        val_f1_scores = []
+        test_f1_scores = []
 
-        train_loader, test_loader, train_dataset, test_dataset = dp.make_train_test_loaders(
+        splits = dp.make_train_val_test_loaders(
             data=data,
             imu_features=dp.IMU_FEATURES,
             window_size=CONFIG["window_size"],
             step_size=CONFIG["step_size"],
-            train_split=CONFIG["train_split"],
+            train_ratio=CONFIG["train_ratio"],
+            val_ratio=CONFIG["val_ratio"],
             batch_size_train=batch_size,
-            batch_size_test=CONFIG["batch_size_test"],
+            batch_size_val=CONFIG["batch_size_eval"],
+            batch_size_test=CONFIG["batch_size_eval"],
         )
 
-        class_weights = dp.compute_class_weights(train_dataset, num_classes, device)
+        class_weights = dp.compute_class_weights(splits.train_dataset, num_classes, device)
 
         for run in range(CONFIG["runs_per_setup"]):
             print(f"\n  [Run {run+1}/{CONFIG['runs_per_setup']} for {setup}]")
@@ -109,8 +113,8 @@ def main():
 
             train_kwargs = {
                 "model": model,
-                "train_loader": train_loader,
-                "val_loader": test_loader,
+                "train_loader": splits.train_loader,
+                "val_loader": splits.val_loader,
                 "device": device,
                 "learning_rate": CONFIG["learning_rate"],
                 "num_epochs": CONFIG["num_epochs"],
@@ -128,52 +132,84 @@ def main():
             if Path(tmp_model_path).exists():
                 model.load_state_dict(torch.load(tmp_model_path, map_location=device))
 
-            eval_result = model_config["eval_fn"](
+            # Validation drives the choice of setup.
+            val_eval = model_config["eval_fn"](
                 model=model,
-                data_loader=test_loader,
+                data_loader=splits.val_loader,
                 device=device,
                 history=history,
                 best_model_path=tmp_model_path,
             )
 
-            f1 = eval_result["metrics"]["f1_score"]
-            f1_scores.append(f1)
-            print(f"  -> Finished Run {run+1}. F1 Score: {f1:.4f}")
+            # Test is only measured, never compared against - the winner below is picked
+            # on validation alone, so this stays an honest held-out estimate.
+            test_eval = model_config["eval_fn"](
+                model=model,
+                data_loader=splits.test_loader,
+                device=device,
+                history=history,
+                best_model_path=tmp_model_path,
+            )
+
+            val_f1 = val_eval["metrics"]["f1_score"]
+            test_f1 = test_eval["metrics"]["f1_score"]
+            val_f1_scores.append(val_f1)
+            test_f1_scores.append(test_f1)
+            print(f"  -> Finished Run {run+1}. Val F1: {val_f1:.4f} | Test F1: {test_f1:.4f}")
 
             if Path(tmp_model_path).exists():
                 Path(tmp_model_path).unlink()
 
-        avg_f1 = np.mean(f1_scores) if f1_scores else 0.0
-        std_f1 = np.std(f1_scores) if f1_scores else 0.0
+        avg_val_f1 = np.mean(val_f1_scores) if val_f1_scores else 0.0
+        std_val_f1 = np.std(val_f1_scores) if val_f1_scores else 0.0
+        avg_test_f1 = np.mean(test_f1_scores) if test_f1_scores else 0.0
+        std_test_f1 = np.std(test_f1_scores) if test_f1_scores else 0.0
 
         results[str(setup)] = {
-            "scores": f1_scores,
-            "average": avg_f1,
-            "std": std_f1,
+            "scores": val_f1_scores,
+            "average": avg_val_f1,
+            "std": std_val_f1,
+            "test_scores": test_f1_scores,
+            "test_average": avg_test_f1,
+            "test_std": std_test_f1,
         }
-        print(f"  Summary for {setup} -> Avg: {avg_f1:.4f}, Variance (Std): {std_f1:.4f}")
+        print(
+            f"  Summary for {setup} -> Val Avg: {avg_val_f1:.4f} (Std {std_val_f1:.4f}) | "
+            f"Test Avg: {avg_test_f1:.4f} (Std {std_test_f1:.4f})"
+        )
 
     # Final summary
     summary_lines = []
     summary_lines.append("\n==================================")
-    summary_lines.append(f"FINAL VALIDATION RESULTS FOR {model_name} (Highest Average Wins):")
+    summary_lines.append(f"FINAL VALIDATION RESULTS FOR {model_name} (Highest Average VALIDATION F1 Wins):")
 
     best_setup = None
     best_avg = -1
+    best_test_avg = 0.0
+    best_test_std = 0.0
 
     for setup_str, stats in results.items():
-        score_list = [f"{s:.4f}" for s in stats['scores']]
-        score_str = ", ".join(score_list)
+        score_str = ", ".join(f"{s:.4f}" for s in stats['scores'])
+        test_score_str = ", ".join(f"{s:.4f}" for s in stats['test_scores'])
         summary_lines.append(f"- {setup_str}")
-        summary_lines.append(f"      Avg F1: {stats['average']:.4f}  |  Std Dev: {stats['std']:.4f}")
-        summary_lines.append(f"      Individual Runs: [{score_str}]")
+        summary_lines.append(f"      Val  F1: {stats['average']:.4f}  |  Std Dev: {stats['std']:.4f}")
+        summary_lines.append(f"      Val  Runs: [{score_str}]")
+        summary_lines.append(f"      Test F1: {stats['test_average']:.4f}  |  Std Dev: {stats['test_std']:.4f}")
+        summary_lines.append(f"      Test Runs: [{test_score_str}]")
 
         if stats['average'] > best_avg:
             best_avg = stats['average']
+            best_test_avg = stats['test_average']
+            best_test_std = stats['test_std']
             best_setup = setup_str
 
     summary_lines.append(f"\n🏆 REAL WINNER: {best_setup} 🏆")
-    summary_lines.append(f"With an average F1 score of {best_avg:.4f} across {CONFIG['runs_per_setup']} runs.")
+    summary_lines.append(
+        f"Chosen on validation F1 {best_avg:.4f} across {CONFIG['runs_per_setup']} runs."
+    )
+    summary_lines.append(
+        f"Held-out TEST F1 for that setup: {best_test_avg:.4f} (Std {best_test_std:.4f}) <- report this."
+    )
     summary_lines.append("==================================\n")
 
     final_output = "\n".join(summary_lines)
