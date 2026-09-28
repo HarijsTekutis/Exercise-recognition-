@@ -157,12 +157,34 @@ def _load_recgym_recordings(
 
 
 
+# Locate the RecGym csv inside `data_path`. The file has been shipped under a few
+# names over time (RecGym.csv, RecGym_new.csv), so accept any of them instead of
+# failing on a hardcoded one.
+RECGYM_CSV_CANDIDATES = ["RecGym.csv", "RecGym_new.csv"]
+
+
+def find_recgym_csv(data_path: str) -> str:
+    for candidate in RECGYM_CSV_CANDIDATES:
+        candidate_path = os.path.join(data_path, candidate)
+        if os.path.exists(candidate_path):
+            return candidate_path
+
+    csv_files = sorted(f for f in os.listdir(data_path) if f.endswith(".csv")) if os.path.isdir(data_path) else []
+    if len(csv_files) == 1:
+        return os.path.join(data_path, csv_files[0])
+
+    raise FileNotFoundError(
+        f"No RecGym csv found in '{data_path}'. Looked for {RECGYM_CSV_CANDIDATES}, "
+        f"found {csv_files or 'no csv files'}."
+    )
+
+
 # filtering
 def load_filtered_recordings(
     data_path: str,
     min_recordings_per_activity: int = 5,
 ) -> List[pd.DataFrame]:
-    recgym_csv_path = os.path.join(data_path, "RecGym.csv")
+    recgym_csv_path = find_recgym_csv(data_path)
     return _load_recgym_recordings(
         recgym_csv_path=recgym_csv_path,
         min_recordings_per_activity=min_recordings_per_activity,
@@ -372,6 +394,36 @@ def subject_independent_split(
     )
 
 
+# Partition the subjects into `n_folds` disjoint groups for cross-validation.
+def subject_cv_folds(
+    subject_ids: Sequence,
+    n_folds: int = 5,
+    seed: int = 42,
+) -> List[List]:
+    """Split the unique subjects into n_folds groups of roughly equal size.
+
+    Fold i then uses group i as TEST and group i+1 (wrapping) as VALIDATION, so across a
+    full sweep every subject is tested exactly once and validated exactly once. Rotating
+    the groups this way is what turns a single held-out pair of people into an estimate
+    that covers the whole cohort - the spread across folds is the part of the uncertainty
+    a fixed split cannot show.
+    """
+    subject_array = np.asarray(subject_ids)
+    unique_subjects = np.unique(subject_array)
+
+    if n_folds < 2:
+        raise ValueError(f"n_folds must be at least 2, got {n_folds}")
+    if len(unique_subjects) < n_folds:
+        raise ValueError(
+            f"Cannot build {n_folds} folds from {len(unique_subjects)} subjects."
+        )
+    if n_folds < 2:
+        raise ValueError("n_folds must be >= 2 so that val and test come from different groups")
+
+    shuffled_subjects = np.random.default_rng(seed).permutation(unique_subjects)
+    return [list(group) for group in np.array_split(shuffled_subjects, n_folds)]
+
+
 # Warn when a split does not cover every activity class.
 def _warn_on_missing_classes(
     split_name: str,
@@ -414,20 +466,45 @@ def make_train_val_test_loaders(
     batch_size_val: int = 1,
     batch_size_test: int = 1,
     seed: int = 42,
+    fold: int = None,
+    n_folds: int = 5,
 ) -> SplitLoaders:
     """Split by subject, fit the scaler on train only, and window each split.
 
     Use `val_loader` for early stopping and hyperparameter search. Touch `test_loader`
     only once, after every hyperparameter is frozen - otherwise the reported score is
     tuned on the data it claims to be held out from.
+
+    With `fold=None` the split is the ratio-balanced one used by the single-split studies.
+    Passing `fold=i` instead selects cross-validation fold i of `n_folds`, which ignores
+    train_ratio/val_ratio and uses the rotating subject groups from `subject_cv_folds`.
     """
     session_subjects = get_session_subjects(data)
-    train_indices, val_indices, test_indices = subject_independent_split(
-        session_subjects,
-        train_ratio=train_ratio,
-        val_ratio=val_ratio,
-        seed=seed,
-    )
+
+    if fold is None:
+        train_indices, val_indices, test_indices = subject_independent_split(
+            session_subjects,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            seed=seed,
+        )
+    else:
+        if not 0 <= fold < n_folds:
+            raise ValueError(f"fold must be in [0, {n_folds}), got {fold}")
+        groups = subject_cv_folds(session_subjects, n_folds=n_folds, seed=seed)
+        test_subjects = groups[fold]
+        val_subjects = groups[(fold + 1) % n_folds]
+        held_out = set(map(str, test_subjects)) | set(map(str, val_subjects))
+        train_subjects = [s for g in groups for s in g if str(s) not in held_out]
+        if not train_subjects:
+            raise ValueError(f"fold {fold} of {n_folds} leaves no training subjects")
+
+        def indices_for(subjects):
+            return np.sort(np.where(np.isin(session_subjects, subjects))[0])
+
+        train_indices = indices_for(train_subjects)
+        val_indices = indices_for(val_subjects)
+        test_indices = indices_for(test_subjects)
 
     train_sessions = [data[index] for index in train_indices]
     val_sessions = [data[index] for index in val_indices]

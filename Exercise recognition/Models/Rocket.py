@@ -50,12 +50,15 @@ class RocketModel:
 		n_jobs: int = -1,
 		random_state: int = 42,
 	):
-		del n_jobs
 		self.num_features = int(num_features)
 		self.num_classes = int(num_classes)
+		# n_jobs used to be discarded here, so the kernel transform ran on about two cores
+		# while the other ten sat idle - the most expensive model in the comparison was the
+		# only one not using the machine. RocketClassifier accepts n_jobs, so pass it on.
 		self.classifier = RocketClassifier(
 			num_kernels=num_kernels,
 			rocket_transform="rocket",
+			n_jobs=n_jobs,
 			random_state=random_state,
 		)
 

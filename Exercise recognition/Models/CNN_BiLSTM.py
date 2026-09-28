@@ -120,6 +120,7 @@ def train_cnnlstm(
         correct_predictions = 0
         total_examples = 0
         running_loss = 0.0
+        running_loss_weight_total = 0.0
 
         for batch_inputs, batch_labels in train_loader:
             batch_inputs = batch_inputs.to(device)
@@ -137,13 +138,18 @@ def train_cnnlstm(
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
             optimizer.step()
 
-            running_loss += loss.item()
+            # CrossEntropyLoss(weight=...) divides by the summed class weight of the batch, not by its size,
+            # so accumulate the same way. Averaging any other way makes the epoch loss depend on batch size;
+            # at batch size 1 the weights cancel entirely and the loss silently becomes unweighted.
+            batch_loss_weight = class_weights[batch_labels].sum().item()
+            running_loss += loss.item() * batch_loss_weight
+            running_loss_weight_total += batch_loss_weight
             predicted_classes = logits.argmax(dim=1)
             correct_predictions += (predicted_classes == batch_labels).sum().item()
             total_examples += batch_labels.size(0)
 
         train_accuracy = 100 * correct_predictions / total_examples if total_examples > 0 else 0.0
-        average_train_loss = running_loss / len(train_loader)
+        average_train_loss = (running_loss / running_loss_weight_total if running_loss_weight_total > 0 else 0.0)
         history["train_losses"].append(average_train_loss)
         history["train_accuracies"].append(train_accuracy)
 
@@ -155,6 +161,7 @@ def train_cnnlstm(
         # Validation phase
         model.eval()
         validation_loss_sum = 0.0
+        validation_loss_weight_total = 0.0
         validation_correct = 0
         validation_total = 0
 
@@ -166,12 +173,14 @@ def train_cnnlstm(
                 validation_logits = model(validation_inputs)
                 validation_loss = criterion(validation_logits, validation_labels)
 
-                validation_loss_sum += validation_loss.item()
+                validation_batch_loss_weight = class_weights[validation_labels].sum().item()
+                validation_loss_sum += validation_loss.item() * validation_batch_loss_weight
+                validation_loss_weight_total += validation_batch_loss_weight
                 validation_predictions = validation_logits.argmax(dim=1)
                 validation_correct += (validation_predictions == validation_labels).sum().item()
                 validation_total += validation_labels.size(0)
 
-        average_validation_loss = validation_loss_sum / len(val_loader)
+        average_validation_loss = (validation_loss_sum / validation_loss_weight_total if validation_loss_weight_total > 0 else 0.0)
         validation_accuracy = 100 * validation_correct / validation_total if validation_total > 0 else 0.0
 
         history["val_losses"].append(average_validation_loss)

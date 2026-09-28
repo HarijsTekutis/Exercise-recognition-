@@ -1,0 +1,18 @@
+# Figures and media - regenerate from the scripts instead of committing them
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.pdf
+*.mp4
+
+# Study outputs (Optuna databases, per-fold results, logs)
+*.db
+*.log
+studies/results/
+studies/cv_results/
+studies/logs/
+studies/studies/
+
+# Personal notes
+*.odt

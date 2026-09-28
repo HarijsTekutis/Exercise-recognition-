@@ -17,3 +17,6 @@ model_comparison_results_*/
 .ipynb_checkpoints/
 tmp*/
 .cache/
+
+# SMTP credentials for the study-finished email (studies/notify.py) - never commit
+notify_credentials.env
